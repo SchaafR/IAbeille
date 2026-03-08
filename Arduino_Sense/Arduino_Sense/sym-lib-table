@@ -1,0 +1,5 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "EI_Connector_Generic")(type "KiCad")(uri "${KIPRJMOD}/Lib/symbole/EI_Connector_Generic.kicad_sym")(options "")(descr ""))
+  (lib (name "EI_Ruche")(type "KiCad")(uri "${KIPRJMOD}/Lib/symbole/EI_Ruche.kicad_sym")(options "")(descr ""))
+)
