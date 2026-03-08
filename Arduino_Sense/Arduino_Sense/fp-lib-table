@@ -1,4 +1,0 @@
-(fp_lib_table
-  (version 7)
-  (lib (name "EI_Ruche")(type "KiCad")(uri "${KIPRJMOD}/Lib/Empreinte/EI_Ruche.pretty")(options "")(descr ""))
-)
