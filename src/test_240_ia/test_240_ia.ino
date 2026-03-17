@@ -1,5 +1,6 @@
-#include <BeeGuardAI_Hornet_BRAML_inferencing.h>
+#include <BeeGuardAI_Hornet_Bee_Bees_G1_V3_inferencing.h>
 #include "edge-impulse-sdk/dsp/image/image.hpp"
+
 #include "esp_camera.h"
 
 // =====================
