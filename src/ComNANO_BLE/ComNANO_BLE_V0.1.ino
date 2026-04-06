@@ -498,13 +498,13 @@ void loop() {
       checkDownlink();
 
       if (modeFonctionnement == 0) {
-        // --- MODE 0 : IA
+        // --- MODE 0 : IA 
         if (checkConditionsSeuils()) { 
           etatActuel = ETAT_ANALYSE_AUDIO;
         }
       } 
       else {
-        // --- MODES 1 & 2
+        // --- MODES 1 & 2 : Périodique ---
         if (millis() - dernierEnvoiLoRa >= intervalleEnvoi) {
           Serial.println("[TIMER] Intervalle atteint, passage à l'envoi.");
           etatActuel = ETAT_ENVOI_LORAWAN;
