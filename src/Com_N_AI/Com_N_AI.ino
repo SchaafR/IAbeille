@@ -1,8 +1,11 @@
 #include <Arduino.h>
-#include <BeeGuardAI_Hornet_Bee_Bees_BRAML_inferencing.h>
+#include <BeeGuardAI_Hornet_Bee_Bees_G1V2_inferencing.h>
 #include "esp_camera.h"
 #include <ctype.h>
 #include <string.h>
+
+// Décommente cette ligne pour activer le debug
+//#define DEBUG_XIAO
 
 // =====================================================
 // XIAO ESP32S3 Sense - Mode piloté par Nano 33 BLE
@@ -10,6 +13,8 @@
 // - protocole UART bit-bang + deep sleep
 // - capture caméra + inference Edge Impulse
 // - tracker anti-doublon léger pour Hornet
+// - fonction unique de debug pour afficher
+//   les inférences et la payload envoyée
 // =====================================================
 
 // =====================================================
@@ -104,7 +109,7 @@ static constexpr uint8_t CONFIRM_FRAMES = 2;
 static constexpr uint8_t MAX_TRACKS = 8;
 static constexpr float MATCH_DIST_RATIO = 0.10f;
 
-// Mettre à true si tu veux débugger sur le port USB série
+// Mettre à true si tu veux aussi les logs détaillés du tracker
 static constexpr bool ENABLE_DEBUG_TRACK = false;
 
 // =====================================================
@@ -165,8 +170,9 @@ int find_best_track_for_detection(const HornetDetection &det, const bool used_tr
 int allocate_track(const HornetDetection &det, uint32_t now_ms);
 void update_track(int idx, const HornetDetection &det, uint32_t now_ms);
 
-bool run_inference_and_count(Counts &counts);
+bool run_inference_and_count(Counts &counts, ei_impulse_result_t &result);
 void process_cmd_run(uint8_t req_id);
+void debugInferenceAndPayload(const Counts &counts, const ei_impulse_result_t &result, const uint8_t *payload, uint8_t len);
 
 // =====================================================
 // Bit-bang UART
@@ -282,7 +288,6 @@ void allerAuSommeil() {
 // Capture image
 // =====================================================
 bool capture_to_snapshot_rgb() {
-  // On vide quelques frames pour stabiliser AEC/AGC
   for (int i = 0; i < 3; i++) {
     camera_fb_t *tmp = esp_camera_fb_get();
     if (tmp) esp_camera_fb_return(tmp);
@@ -325,9 +330,9 @@ bool capture_to_snapshot_rgb() {
 
       uint16_t p = (uint16_t)fb->buf[px_off] | ((uint16_t)fb->buf[px_off + 1] << 8);
 
-      *dst++ = (uint8_t)(((p >> 11) & 0x1F) * 255 / 31); // R
-      *dst++ = (uint8_t)(((p >> 5)  & 0x3F) * 255 / 63); // G
-      *dst++ = (uint8_t)(((p >> 0)  & 0x1F) * 255 / 31); // B
+      *dst++ = (uint8_t)(((p >> 11) & 0x1F) * 255 / 31);
+      *dst++ = (uint8_t)(((p >> 5)  & 0x3F) * 255 / 63);
+      *dst++ = (uint8_t)(((p >> 0)  & 0x1F) * 255 / 31);
     }
   }
 
@@ -482,9 +487,77 @@ void update_track(int idx, const HornetDetection &det, uint32_t now_ms) {
 }
 
 // =====================================================
+// Debug unique
+// =====================================================
+void debugInferenceAndPayload(const Counts &counts, const ei_impulse_result_t &result, const uint8_t *payload, uint8_t len) {
+#ifndef DEBUG_XIAO
+  return;
+#endif
+
+  Serial.println("========== DEBUG XIAO ==========");
+
+  Serial.println("[INFERENCE]");
+  Serial.print("Bounding boxes count = ");
+  Serial.println(result.bounding_boxes_count);
+
+  if (result.bounding_boxes_count == 0) {
+    Serial.println("No objects found");
+  } else {
+    for (size_t i = 0; i < result.bounding_boxes_count; i++) {
+      const auto &bb = result.bounding_boxes[i];
+      if (bb.value == 0) continue;
+
+      Serial.print(" - ");
+      Serial.print(bb.label);
+      Serial.print(" | score=");
+      Serial.print(bb.value, 3);
+      Serial.print(" | x=");
+      Serial.print(bb.x);
+      Serial.print(" y=");
+      Serial.print(bb.y);
+      Serial.print(" w=");
+      Serial.print(bb.width);
+      Serial.print(" h=");
+      Serial.println(bb.height);
+    }
+  }
+
+  Serial.println("[COUNTS]");
+  Serial.print("Hornet frame count = ");
+  Serial.println(counts.hornet);
+  Serial.print("Bee frame count    = ");
+  Serial.println(counts.bee);
+  Serial.print("Bees frame count   = ");
+  Serial.println(counts.bees);
+  Serial.print("Hornet event total = ");
+  Serial.println(g_hornet_event_count);
+
+  Serial.println("[PAYLOAD SENT]");
+  Serial.print("Length = ");
+  Serial.println(len);
+
+  Serial.print("HEX : ");
+  for (uint8_t i = 0; i < len; i++) {
+    if (payload[i] < 0x10) Serial.print("0");
+    Serial.print(payload[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  Serial.print("DEC : ");
+  for (uint8_t i = 0; i < len; i++) {
+    Serial.print(payload[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  Serial.println("================================");
+}
+
+// =====================================================
 // Inference + comptage
 // =====================================================
-bool run_inference_and_count(Counts &counts) {
+bool run_inference_and_count(Counts &counts, ei_impulse_result_t &result) {
   if (!capture_to_snapshot_rgb()) {
     return false;
   }
@@ -493,7 +566,7 @@ bool run_inference_and_count(Counts &counts) {
   signal.total_length = EI_CLASSIFIER_NN_INPUT_FRAME_SIZE;
   signal.get_data = &ei_get_data;
 
-  ei_impulse_result_t result = {0};
+  result = {0};
 
   EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
   if (err != EI_IMPULSE_OK) {
@@ -561,7 +634,9 @@ void process_cmd_run(uint8_t req_id) {
   digitalWrite(LED_BUILTIN, HIGH);
 
   Counts counts;
-  bool ok = run_inference_and_count(counts);
+  ei_impulse_result_t result = {0};
+
+  bool ok = run_inference_and_count(counts, result);
 
   if (!ok) {
     uint8_t err_payload[2] = { req_id, ERR_CLASSIFIER };
@@ -570,7 +645,6 @@ void process_cmd_run(uint8_t req_id) {
     return;
   }
 
-  // Résultat renvoyé à la Nano
   // [0] req_id
   // [1..2] hornet frame count (LE)
   // [3..4] bee frame count (LE)
@@ -587,6 +661,7 @@ void process_cmd_run(uint8_t req_id) {
     (uint8_t)(g_hornet_event_count & 0xFF)
   };
 
+  debugInferenceAndPayload(counts, result, res, 8);
   send_packet(RESULT, res, 8);
 
   digitalWrite(LED_BUILTIN, LOW);
@@ -630,7 +705,6 @@ void loop() {
     }
   }
 
-  // Sécurité : si la Nano ne donne pas d'ordre pendant 15 s, deep sleep
   if (millis() > 15000) {
     allerAuSommeil();
   }
