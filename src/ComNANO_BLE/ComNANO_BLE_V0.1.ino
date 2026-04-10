@@ -14,12 +14,6 @@
 // LoRaWAN module = Serial1
 // =====================
 
-// ---------- Modes de fonctionnement (Downlink) -----------
-// 0: Mode IA (Détection frelon), 1: 30 mins, 2: 2 mins (Test)
-uint8_t modeFonctionnement = 0; 
-unsigned long intervalleEnvoi = 0; // En millisecondes
-unsigned long dernierEnvoiLoRa = 0;
-
 // ------- AI Output --------
 float lastTemp = NAN;
 float lastHum = NAN;
@@ -380,41 +374,6 @@ String buildLoRaPayload() {
 
   return String(hexPayload);
 }
-
-void checkDownlink() {
-  if (Serial1.available()) {
-    String line = Serial1.readStringUntil('\n');
-    Serial.print("[LoRa RX] : "); Serial.println(line);
-
-    int pos = line.indexOf("RX:");
-    if (pos >= 0) {
-      String hexVal = line.substring(pos + 3);
-      hexVal.trim();
-      hexVal.replace("\"", "");
-
-      // Conversion de la valeur Hexa reçue en entier
-      int commande = (int)strtol(hexVal.c_str(), NULL, 16);
-
-      switch (commande) {
-        case 0:
-          modeFonctionnement = 0;
-          Serial.println("=> Mode activé : Détection IA Frelon");
-          break;
-        case 1:
-          modeFonctionnement = 1;
-          intervalleEnvoi = 30 * 60 * 1000; // 30 minutes
-          Serial.println("=> Mode activé : Envoi périodique 30 min");
-          break;
-        case 2:
-          modeFonctionnement = 2;
-          intervalleEnvoi = 2 * 60 * 1000; // 2 minutes (Test)
-          Serial.println("=> Mode activé : Envoi périodique 2 min");
-          break;
-      }
-    }
-  }
-}
-
 void setup() {
   Serial.begin(115200);
   while (!Serial) {}
@@ -494,40 +453,36 @@ void loop() {
       break;
 
     case ETAT_VERIFICATION:
-      // On vérifie toujours si un Downlink est arrivé
-      checkDownlink();
-
-      if (modeFonctionnement == 0) {
-        // --- MODE 0 : IA 
-        if (checkConditionsSeuils()) { 
-          etatActuel = ETAT_ANALYSE_AUDIO;
-        }
-      } 
-      else {
-        // --- MODES 1 & 2 : Périodique ---
-        if (millis() - dernierEnvoiLoRa >= intervalleEnvoi) {
-          Serial.println("[TIMER] Intervalle atteint, passage à l'envoi.");
-          etatActuel = ETAT_ENVOI_LORAWAN;
-        }
+      Serial.println("[ÉTAT] Vérification T° et Lux...");
+      
+      printDHT22();
+      printLux();
+      
+      if (lastTemp > 12.0 && lastLux > 100.0) {
+        Serial.println("=> Favorable: Passage à l'analyse audio.");
+        etatActuel = ETAT_ANALYSE_AUDIO;
+      } else {
+        Serial.println("=> Défavorable: Retour au sommeil.");
+        etatActuel = ETAT_SOMMEIL;
       }
       break;
 
     case ETAT_ANALYSE_AUDIO:
       Serial.println("[ÉTAT] Analyse Audio Réelle...");
       {
-        float probaHornet = HornetAudio::getHornetProbability();
+        float probaHornet = HornetAudio::getHornetProbability(); [cite: 631]
         Serial.print("Probabilité frelon : ");
         Serial.println(probaHornet, 3);
 
-        if (probaHornet > 0.85) { // Seuil de certitude à 85% 
+        if (probaHornet > 0.85) { // Seuil de certitude à 85% [cite: 650]
           Serial.println("=> Buzz frelon détecté. Activation Caméra.");
-          etatActuel = ETAT_ANALYSE_CAMERA;
+          etatActuel = ETAT_ANALYSE_CAMERA; [cite: 608]
         } else if (probaHornet < 0) {
           Serial.println("=> Erreur capture audio. Retour vérification.");
-          etatActuel = ETAT_VERIFICATION; 
+          etatActuel = ETAT_VERIFICATION; [cite: 618]
         } else {
           Serial.println("=> Rien de suspect. Retour vérification.");
-          etatActuel = ETAT_VERIFICATION; 
+          etatActuel = ETAT_VERIFICATION; [cite: 609]
         }
       }
       break;
@@ -591,19 +546,16 @@ void loop() {
       break;
 
     case ETAT_ENVOI_LORAWAN:
-      Serial.println("[ÉTAT] Envoi LoRaWAN...");
+      Serial.println("[ÉTAT] Activation LoRaWAN...");
       {
         String loraPayload = buildLoRaPayload();
         sendLoRaPayload(loraPayload);
+        Serial.println(loraPayload);
         
-        dernierEnvoiLoRa = millis(); // On reset le timer ici
+        Serial.println("=> Attente de 40s...");
+        delay(40000); // 40 secondes
         
-        // Après l'envoi, on écoute pendant quelques secondes pour le Downlink
-        unsigned long listenStart = millis();
-        while (millis() - listenStart < 2000) { 
-          checkDownlink(); 
-        }
-
+        Serial.println("=> Fin d'attente. Retour vérification.");
         etatActuel = ETAT_VERIFICATION;
       }
       break;
