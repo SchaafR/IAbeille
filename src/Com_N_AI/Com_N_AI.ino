@@ -4,45 +4,49 @@
 #include <ctype.h>
 #include <string.h>
 
-// Décommente cette ligne pour activer le debug
+// Décommente cette ligne pour activer le debug série
 //#define DEBUG_XIAO
 
 // =====================================================
-// XIAO ESP32S3 Sense - Mode piloté par Nano 33 BLE
-// Fusion:
-// - protocole UART bit-bang + deep sleep
+// XIAO ESP32S3 Sense - émission continue tant que l'alim existe
+// - auto démarrage au boot
 // - capture caméra + inference Edge Impulse
-// - tracker anti-doublon léger pour Hornet
-// - fonction unique de debug pour afficher
-//   les inférences et la payload envoyée
+// - envoi continu des scores de confiance (%)
+// - aucune réception UART
+// - aucune commande RUN/SLEEP
+// - checksum XOR à la fin de chaque trame
+// - arrêt uniquement par coupure d'alimentation externe
 // =====================================================
 
 // =====================================================
 // Configuration Pins
 // =====================================================
 static const int PIN_TX = D6;
-static const int PIN_RX = D7;
-static const int PIN_WAKE_IN = D0; // Reçoit SIGINT de la Nano (D3)
-
 static const uint32_t BAUD = 4800;
 static const uint32_t BIT_US = 1000000UL / BAUD;
 
+// Intervalle entre 2 trames
+static const uint32_t LOOP_DELAY_MS = 200;
+
 // =====================================================
 // Protocole
+// Trame :
+// [0]  0xA5
+// [1]  0x5A
+// [2]  type
+// [3]  len
+// [4..] payload
+// [fin] checksum XOR de tous les octets précédents
 // =====================================================
 enum MsgType : uint8_t {
-  CMD_RUN   = 0x01,
   RESULT    = 0x02,
-  ACK       = 0x03,
-  CMD_SLEEP = 0x04,
   ERROR_MSG = 0x05
 };
 
 enum ErrorCode : uint8_t {
   ERR_NONE            = 0x00,
   ERR_CAMERA_CAPTURE  = 0x01,
-  ERR_CLASSIFIER      = 0x02,
-  ERR_BAD_PACKET      = 0x03
+  ERR_CLASSIFIER      = 0x02
 };
 
 // =====================================================
@@ -99,83 +103,37 @@ static camera_config_t camera_config = {
 };
 
 static uint8_t *snapshot = nullptr;
-
-// =====================================================
-// Paramètres anti-doublon Hornet
-// =====================================================
-static constexpr float HORNET_MIN_SCORE = 0.60f;
-static constexpr uint32_t TRACK_TTL_MS = 1000;
-static constexpr uint8_t CONFIRM_FRAMES = 2;
-static constexpr uint8_t MAX_TRACKS = 8;
-static constexpr float MATCH_DIST_RATIO = 0.10f;
-
-// Mettre à true si tu veux aussi les logs détaillés du tracker
-static constexpr bool ENABLE_DEBUG_TRACK = false;
+static uint8_t g_frame_id = 0;
 
 // =====================================================
 // Structures
 // =====================================================
-struct Counts {
-  uint16_t hornet;
-  uint16_t bee;
-  uint16_t bees;
+struct Scores {
+  uint8_t hornet; // 0..100
+  uint8_t bee;    // 0..100
+  uint8_t bees;   // 0..100
 };
-
-struct HornetDetection {
-  int x;
-  int y;
-  int w;
-  int h;
-  float score;
-};
-
-struct HornetTrack {
-  bool active;
-  bool counted;
-  int cx;
-  int cy;
-  int w;
-  int h;
-  uint8_t seen_frames;
-  uint32_t first_seen_ms;
-  uint32_t last_seen_ms;
-};
-
-static HornetTrack g_tracks[MAX_TRACKS];
-static uint32_t g_hornet_event_count = 0;
 
 // =====================================================
 // Prototypes
 // =====================================================
 static inline void bb_wait_bit();
 void bb_tx_byte(uint8_t b);
-bool bb_rx_byte(uint8_t &out, uint32_t timeout_us = 500000);
 void send_packet(uint8_t type, const uint8_t *payload, uint8_t len);
-bool recv_packet(uint8_t &type, uint8_t *payload, uint8_t &len, uint32_t timeout_us = 800000);
-
-void allerAuSommeil();
 
 bool capture_to_snapshot_rgb();
 int ei_get_data(size_t offset, size_t length, float *out_ptr);
 
 static bool str_ieq(const char *a, const char *b);
+static uint8_t score_to_percent(float v);
 
-static inline int center_x(int x, int w);
-static inline int center_y(int y, int h);
-static inline int match_dist_px();
-
-void reset_all_tracks();
-void expire_old_tracks(uint32_t now_ms);
-int find_best_track_for_detection(const HornetDetection &det, const bool used_tracks[]);
-int allocate_track(const HornetDetection &det, uint32_t now_ms);
-void update_track(int idx, const HornetDetection &det, uint32_t now_ms);
-
-bool run_inference_and_count(Counts &counts, ei_impulse_result_t &result);
-void process_cmd_run(uint8_t req_id);
-void debugInferenceAndPayload(const Counts &counts, const ei_impulse_result_t &result, const uint8_t *payload, uint8_t len);
+bool run_inference_and_score(Scores &scores, ei_impulse_result_t &result);
+void send_result_frame(uint8_t frame_id);
+void send_error_frame(uint8_t frame_id, uint8_t err);
+void debugInferenceAndPayload(const Scores &scores, const ei_impulse_result_t &result, const uint8_t *payload, uint8_t len);
 
 // =====================================================
-// Bit-bang UART
+// Bit-bang UART TX only
 // =====================================================
 static inline void bb_wait_bit() {
   delayMicroseconds(BIT_US);
@@ -199,89 +157,23 @@ void bb_tx_byte(uint8_t b) {
   interrupts();
 }
 
-bool bb_rx_byte(uint8_t &out, uint32_t timeout_us) {
-  uint32_t t0 = micros();
-
-  while (digitalRead(PIN_RX) == HIGH) {
-    if ((micros() - t0) > timeout_us) return false;
-  }
-
-  noInterrupts();
-
-  delayMicroseconds(BIT_US + BIT_US / 2);
-
-  uint8_t b = 0;
-  for (int i = 0; i < 8; i++) {
-    b |= (digitalRead(PIN_RX) ? 1 : 0) << i;
-    delayMicroseconds(BIT_US);
-  }
-
-  delayMicroseconds(BIT_US);
-
-  interrupts();
-
-  out = b;
-  return true;
-}
-
 void send_packet(uint8_t type, const uint8_t *payload, uint8_t len) {
   uint8_t chk = 0;
 
-  bb_tx_byte(0xA5); delay(2); chk ^= 0xA5;
-  bb_tx_byte(0x5A); delay(2); chk ^= 0x5A;
-  bb_tx_byte(type); delay(2); chk ^= type;
-  bb_tx_byte(len);  delay(2); chk ^= len;
+  bb_tx_byte(0xA5); chk ^= 0xA5; delay(2);
+  bb_tx_byte(0x5A); chk ^= 0x5A; delay(2);
+  bb_tx_byte(type); chk ^= type; delay(2);
+  bb_tx_byte(len);  chk ^= len;  delay(2);
 
   for (uint8_t i = 0; i < len; i++) {
     bb_tx_byte(payload[i]);
-    delay(2);
     chk ^= payload[i];
+    delay(2);
   }
 
+  // checksum XOR final
   bb_tx_byte(chk);
   delay(2);
-}
-
-bool recv_packet(uint8_t &type, uint8_t *payload, uint8_t &len, uint32_t timeout_us) {
-  uint8_t b, chk = 0;
-
-  do {
-    if (!bb_rx_byte(b, timeout_us)) return false;
-  } while (b != 0xA5);
-  chk ^= b;
-
-  if (!bb_rx_byte(b, timeout_us)) return false;
-  if (b != 0x5A) return false;
-  chk ^= b;
-
-  if (!bb_rx_byte(type, timeout_us)) return false;
-  chk ^= type;
-
-  if (!bb_rx_byte(len, timeout_us)) return false;
-  chk ^= len;
-
-  if (len > 32) return false;
-
-  for (uint8_t i = 0; i < len; i++) {
-    if (!bb_rx_byte(payload[i], timeout_us)) return false;
-    chk ^= payload[i];
-  }
-
-  uint8_t rx_chk;
-  if (!bb_rx_byte(rx_chk, timeout_us)) return false;
-
-  return (chk == rx_chk);
-}
-
-// =====================================================
-// Sommeil
-// =====================================================
-void allerAuSommeil() {
-  esp_camera_deinit();
-  delay(100);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_WAKE_IN, 1);
-  Serial.flush();
-  esp_deep_sleep_start();
 }
 
 // =====================================================
@@ -359,205 +251,70 @@ static bool str_ieq(const char *a, const char *b) {
   return (*a == '\0' && *b == '\0');
 }
 
-static inline int center_x(int x, int w) {
-  return x + (w / 2);
-}
-
-static inline int center_y(int y, int h) {
-  return y + (h / 2);
-}
-
-static inline int match_dist_px() {
-  int m = (IN_W < IN_H) ? IN_W : IN_H;
-  int d = (int)(m * MATCH_DIST_RATIO);
-  if (d < 6) d = 6;
-  return d;
+static uint8_t score_to_percent(float v) {
+  if (v < 0.0f) v = 0.0f;
+  if (v > 1.0f) v = 1.0f;
+  return (uint8_t)(v * 100.0f + 0.5f);
 }
 
 // =====================================================
-// Tracker anti-doublon
+// Debug
 // =====================================================
-void reset_all_tracks() {
-  for (int i = 0; i < MAX_TRACKS; i++) {
-    g_tracks[i].active = false;
-    g_tracks[i].counted = false;
-    g_tracks[i].cx = 0;
-    g_tracks[i].cy = 0;
-    g_tracks[i].w = 0;
-    g_tracks[i].h = 0;
-    g_tracks[i].seen_frames = 0;
-    g_tracks[i].first_seen_ms = 0;
-    g_tracks[i].last_seen_ms = 0;
-  }
-}
-
-void expire_old_tracks(uint32_t now_ms) {
-  for (int i = 0; i < MAX_TRACKS; i++) {
-    if (!g_tracks[i].active) continue;
-
-    if ((now_ms - g_tracks[i].last_seen_ms) > TRACK_TTL_MS) {
-      if (ENABLE_DEBUG_TRACK) {
-        Serial.print("[TRACK] expired idx=");
-        Serial.println(i);
-      }
-      g_tracks[i].active = false;
-    }
-  }
-}
-
-int find_best_track_for_detection(const HornetDetection &det, const bool used_tracks[]) {
-  const int cx = center_x(det.x, det.w);
-  const int cy = center_y(det.y, det.h);
-
-  const int max_d = match_dist_px();
-  const int max_d2 = max_d * max_d;
-
-  int best_idx = -1;
-  int best_d2 = 0x7FFFFFFF;
-
-  for (int i = 0; i < MAX_TRACKS; i++) {
-    if (!g_tracks[i].active) continue;
-    if (used_tracks[i]) continue;
-
-    int dx = cx - g_tracks[i].cx;
-    int dy = cy - g_tracks[i].cy;
-    int d2 = dx * dx + dy * dy;
-
-    if (d2 <= max_d2 && d2 < best_d2) {
-      best_d2 = d2;
-      best_idx = i;
-    }
-  }
-
-  return best_idx;
-}
-
-int allocate_track(const HornetDetection &det, uint32_t now_ms) {
-  for (int i = 0; i < MAX_TRACKS; i++) {
-    if (!g_tracks[i].active) {
-      g_tracks[i].active = true;
-      g_tracks[i].counted = false;
-      g_tracks[i].cx = center_x(det.x, det.w);
-      g_tracks[i].cy = center_y(det.y, det.h);
-      g_tracks[i].w = det.w;
-      g_tracks[i].h = det.h;
-      g_tracks[i].seen_frames = 1;
-      g_tracks[i].first_seen_ms = now_ms;
-      g_tracks[i].last_seen_ms = now_ms;
-
-      if (ENABLE_DEBUG_TRACK) {
-        Serial.print("[TRACK] create idx=");
-        Serial.println(i);
-      }
-
-      if (!g_tracks[i].counted && CONFIRM_FRAMES <= 1) {
-        g_tracks[i].counted = true;
-        g_hornet_event_count++;
-      }
-
-      return i;
-    }
-  }
-
-  if (ENABLE_DEBUG_TRACK) {
-    Serial.println("[TRACK] no free slot");
-  }
-
-  return -1;
-}
-
-void update_track(int idx, const HornetDetection &det, uint32_t now_ms) {
-  if (idx < 0 || idx >= MAX_TRACKS) return;
-  if (!g_tracks[idx].active) return;
-
-  g_tracks[idx].cx = center_x(det.x, det.w);
-  g_tracks[idx].cy = center_y(det.y, det.h);
-  g_tracks[idx].w = det.w;
-  g_tracks[idx].h = det.h;
-  g_tracks[idx].last_seen_ms = now_ms;
-
-  if (g_tracks[idx].seen_frames < 255) {
-    g_tracks[idx].seen_frames++;
-  }
-
-  if (!g_tracks[idx].counted && g_tracks[idx].seen_frames >= CONFIRM_FRAMES) {
-    g_tracks[idx].counted = true;
-    g_hornet_event_count++;
-  }
-}
-
-// =====================================================
-// Debug unique
-// =====================================================
-void debugInferenceAndPayload(const Counts &counts, const ei_impulse_result_t &result, const uint8_t *payload, uint8_t len) {
+void debugInferenceAndPayload(const Scores &scores, const ei_impulse_result_t &result, const uint8_t *payload, uint8_t len) {
 #ifndef DEBUG_XIAO
   return;
 #endif
 
   Serial.println("========== DEBUG XIAO ==========");
-
   Serial.println("[INFERENCE]");
   Serial.print("Bounding boxes count = ");
   Serial.println(result.bounding_boxes_count);
 
-  if (result.bounding_boxes_count == 0) {
-    Serial.println("No objects found");
-  } else {
-    for (size_t i = 0; i < result.bounding_boxes_count; i++) {
-      const auto &bb = result.bounding_boxes[i];
-      if (bb.value == 0) continue;
+  for (size_t i = 0; i < result.bounding_boxes_count; i++) {
+    const auto &bb = result.bounding_boxes[i];
+    if (bb.value == 0) continue;
 
-      Serial.print(" - ");
-      Serial.print(bb.label);
-      Serial.print(" | score=");
-      Serial.print(bb.value, 3);
-      Serial.print(" | x=");
-      Serial.print(bb.x);
-      Serial.print(" y=");
-      Serial.print(bb.y);
-      Serial.print(" w=");
-      Serial.print(bb.width);
-      Serial.print(" h=");
-      Serial.println(bb.height);
-    }
+    Serial.print(" - ");
+    Serial.print(bb.label);
+    Serial.print(" | score=");
+    Serial.print(bb.value, 3);
+    Serial.print(" | percent=");
+    Serial.print(score_to_percent(bb.value));
+    Serial.print("%");
+    Serial.print(" | x=");
+    Serial.print(bb.x);
+    Serial.print(" y=");
+    Serial.print(bb.y);
+    Serial.print(" w=");
+    Serial.print(bb.width);
+    Serial.print(" h=");
+    Serial.println(bb.height);
   }
 
-  Serial.println("[COUNTS]");
-  Serial.print("Hornet frame count = ");
-  Serial.println(counts.hornet);
-  Serial.print("Bee frame count    = ");
-  Serial.println(counts.bee);
-  Serial.print("Bees frame count   = ");
-  Serial.println(counts.bees);
-  Serial.print("Hornet event total = ");
-  Serial.println(g_hornet_event_count);
+  Serial.println("[SCORES]");
+  Serial.print("Hornet = ");
+  Serial.print(scores.hornet);
+  Serial.println("%");
+  Serial.print("Bee    = ");
+  Serial.print(scores.bee);
+  Serial.println("%");
+  Serial.print("Bees   = ");
+  Serial.print(scores.bees);
+  Serial.println("%");
 
-  Serial.println("[PAYLOAD SENT]");
-  Serial.print("Length = ");
-  Serial.println(len);
-
-  Serial.print("HEX : ");
-  for (uint8_t i = 0; i < len; i++) {
-    if (payload[i] < 0x10) Serial.print("0");
-    Serial.print(payload[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
-
-  Serial.print("DEC : ");
+  Serial.println("[PAYLOAD]");
   for (uint8_t i = 0; i < len; i++) {
     Serial.print(payload[i]);
     Serial.print(" ");
   }
   Serial.println();
-
   Serial.println("================================");
 }
 
 // =====================================================
-// Inference + comptage
+// Inference
 // =====================================================
-bool run_inference_and_count(Counts &counts, ei_impulse_result_t &result) {
+bool run_inference_and_score(Scores &scores, ei_impulse_result_t &result) {
   if (!capture_to_snapshot_rgb()) {
     return false;
   }
@@ -573,54 +330,24 @@ bool run_inference_and_count(Counts &counts, ei_impulse_result_t &result) {
     return false;
   }
 
-  counts.hornet = 0;
-  counts.bee = 0;
-  counts.bees = 0;
-
-  const uint32_t now_ms = millis();
-  expire_old_tracks(now_ms);
-
-  bool used_tracks[MAX_TRACKS];
-  for (int i = 0; i < MAX_TRACKS; i++) {
-    used_tracks[i] = false;
-  }
+  scores.hornet = 0;
+  scores.bee = 0;
+  scores.bees = 0;
 
   for (size_t i = 0; i < result.bounding_boxes_count; i++) {
-    auto bb = result.bounding_boxes[i];
-
+    const auto &bb = result.bounding_boxes[i];
     if (bb.value == 0) continue;
 
+    uint8_t percent = score_to_percent(bb.value);
+
     if (str_ieq(bb.label, "Hornet")) {
-      counts.hornet++;
-
-      if (bb.value < HORNET_MIN_SCORE) {
-        continue;
-      }
-
-      HornetDetection det;
-      det.x = bb.x;
-      det.y = bb.y;
-      det.w = bb.width;
-      det.h = bb.height;
-      det.score = bb.value;
-
-      int track_idx = find_best_track_for_detection(det, used_tracks);
-
-      if (track_idx >= 0) {
-        update_track(track_idx, det, now_ms);
-        used_tracks[track_idx] = true;
-      } else {
-        int new_idx = allocate_track(det, now_ms);
-        if (new_idx >= 0) {
-          used_tracks[new_idx] = true;
-        }
-      }
+      if (percent > scores.hornet) scores.hornet = percent;
     }
     else if (str_ieq(bb.label, "Bee")) {
-      counts.bee++;
+      if (percent > scores.bee) scores.bee = percent;
     }
     else if (str_ieq(bb.label, "Bees")) {
-      counts.bees++;
+      if (percent > scores.bees) scores.bees = percent;
     }
   }
 
@@ -628,43 +355,40 @@ bool run_inference_and_count(Counts &counts, ei_impulse_result_t &result) {
 }
 
 // =====================================================
-// Traitement commande RUN
+// Emission trames
 // =====================================================
-void process_cmd_run(uint8_t req_id) {
+void send_result_frame(uint8_t frame_id) {
   digitalWrite(LED_BUILTIN, HIGH);
 
-  Counts counts;
+  Scores scores;
   ei_impulse_result_t result = {0};
 
-  bool ok = run_inference_and_count(counts, result);
-
+  bool ok = run_inference_and_score(scores, result);
   if (!ok) {
-    uint8_t err_payload[2] = { req_id, ERR_CLASSIFIER };
-    send_packet(ERROR_MSG, err_payload, 2);
+    send_error_frame(frame_id, ERR_CLASSIFIER);
     digitalWrite(LED_BUILTIN, LOW);
     return;
   }
 
-  // [0] req_id
-  // [1..2] hornet frame count (LE)
-  // [3..4] bee frame count (LE)
-  // [5..6] bees frame count (LE)
-  // [7] hornet event count anti-doublon (LSB only)
-  uint8_t res[8] = {
-    req_id,
-    (uint8_t)(counts.hornet & 0xFF),
-    (uint8_t)((counts.hornet >> 8) & 0xFF),
-    (uint8_t)(counts.bee & 0xFF),
-    (uint8_t)((counts.bee >> 8) & 0xFF),
-    (uint8_t)(counts.bees & 0xFF),
-    (uint8_t)((counts.bees >> 8) & 0xFF),
-    (uint8_t)(g_hornet_event_count & 0xFF)
+  uint8_t payload[4] = {
+    frame_id,
+    scores.hornet,
+    scores.bee,
+    scores.bees
   };
 
-  debugInferenceAndPayload(counts, result, res, 8);
-  send_packet(RESULT, res, 8);
+  debugInferenceAndPayload(scores, result, payload, 4);
+  send_packet(RESULT, payload, 4);
 
-  digitalWrite(LED_BUILTIN, LOW);
+  (LED_BUILTIN, LOW);
+}
+
+void send_error_frame(uint8_t frame_id, uint8_t err) {
+  uint8_t payload[2] = {
+    frame_id,
+    err
+  };
+  send_packet(ERROR_MSG, payload, 2);
 }
 
 // =====================================================
@@ -676,36 +400,20 @@ void setup() {
   pinMode(PIN_TX, OUTPUT);
   digitalWrite(PIN_TX, HIGH);
 
-  pinMode(PIN_RX, INPUT_PULLUP);
-  pinMode(PIN_WAKE_IN, INPUT_PULLUP);
-
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
-  reset_all_tracks();
-
   if (esp_camera_init(&camera_config) != ESP_OK) {
-    allerAuSommeil();
+    send_error_frame(g_frame_id++, ERR_CAMERA_CAPTURE);
+    while (true) {
+      delay(1000);
+    }
   }
+
+  delay(300);
 }
 
 void loop() {
-  uint8_t type, len, payload[32];
-
-  if (recv_packet(type, payload, len, 5000000)) {
-    if (type == CMD_RUN && len >= 1) {
-      process_cmd_run(payload[0]);
-    }
-    else if (type == CMD_SLEEP) {
-      allerAuSommeil();
-    }
-    else {
-      uint8_t err_payload[2] = { 0, ERR_BAD_PACKET };
-      send_packet(ERROR_MSG, err_payload, 2);
-    }
-  }
-
-  if (millis() > 15000) {
-    allerAuSommeil();
-  }
+  send_result_frame(g_frame_id++);
+  delay(LOOP_DELAY_MS);
 }
