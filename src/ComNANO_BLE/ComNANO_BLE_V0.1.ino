@@ -2,6 +2,7 @@
 #include <DHT.h>
 #include <BH1750.h>
 #include <Wire.h>
+#include "HornetAudio.h" 
 // =====================
 // Arduino Nano 33 BLE
 // Bit-bang UART
@@ -423,6 +424,11 @@ void setup() {
   } else {
     Serial.println("ATTENTE OU ECHEC");
   }
+  
+  // Hornet Audio detection
+  if (!HornetAudio::begin()) {
+    Serial.println("Erreur fatale : Microphone non détecté");
+  }
 }
 
 // ---------- Loop ----------
@@ -462,18 +468,21 @@ void loop() {
       break;
 
     case ETAT_ANALYSE_AUDIO:
-      Serial.println("[ÉTAT] Analyse Audio...");
-      
+      Serial.println("[ÉTAT] Analyse Audio Réelle...");
       {
-        // Simulation IA Audio (0 ou 1)
-        int resultatAudio = random(0, 2); 
-        
-        if (resultatAudio == 1) {
-          Serial.println("=> Buzz détecté (1). Activation Caméra.");
-          etatActuel = ETAT_ANALYSE_CAMERA;
+        float probaHornet = HornetAudio::getHornetProbability(); [cite: 631]
+        Serial.print("Probabilité frelon : ");
+        Serial.println(probaHornet, 3);
+
+        if (probaHornet > 0.85) { // Seuil de certitude à 85% [cite: 650]
+          Serial.println("=> Buzz frelon détecté. Activation Caméra.");
+          etatActuel = ETAT_ANALYSE_CAMERA; [cite: 608]
+        } else if (probaHornet < 0) {
+          Serial.println("=> Erreur capture audio. Retour vérification.");
+          etatActuel = ETAT_VERIFICATION; [cite: 618]
         } else {
-          Serial.println("=> Rien (0). Retour vérification.");
-          etatActuel = ETAT_VERIFICATION;
+          Serial.println("=> Rien de suspect. Retour vérification.");
+          etatActuel = ETAT_VERIFICATION; [cite: 609]
         }
       }
       break;
