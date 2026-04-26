@@ -1,0 +1,23 @@
+function decodeUplink(input) {
+  var b = input.bytes;
+  var data = {};
+
+  data.key = "76mqfbrqwa4qa6qb";
+
+  // --- Décodage des capteurs (Temp, Hum, etc.) ---
+  if (b && b.length >= 9) {
+    var tRaw = (b[0] << 8) | b[1];
+    if (tRaw & 0x8000) tRaw -= 0x10000;
+    data.t = tRaw / 10.0;
+    data.t_1 = (b[2] << 8) | b[3];
+    data.t_0 = b[4];
+    data.l = (b[5] << 8) | b[6];
+    data.h = b[7];
+    data.bv = b[8];
+  }
+
+
+  return {
+    data: data
+  };
+}
