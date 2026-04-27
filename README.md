@@ -91,7 +91,7 @@ Le module LoRa E5 utilise l'activation **OTAA**.
 2. Connectez le **XIAO ESP32S3**.
 3. Sélectionnez le port correspondant et le type de carte **XIAO_ESP32S3**.
 4. Cliquez sur **Upload** (→).
-5. Répétez l'opération pour l'Arduino Nano si nécessaire.
+5. Répétez l'opération pour l'Arduino Nano avec le fichier `hornet_lib_3.ino`.
 
 ### Déploiement physique
 > [!IMPORTANT]
