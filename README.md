@@ -118,4 +118,4 @@ Le module LoRa E5 utilise l'activation **OTAA**.
 Projet réalisé dans le cadre de la 4ème année à **Polytech Sorbonne**. Merci à l'équipe pédagogique et aux encadrants pour leur soutien technique et méthodologique.
 
 ## Contacte
-En cas de problème ou de questions,vous pouvez nous contacter à l'adresse : schaarem@gmail.com
+En cas de problème ou de questions, vous pouvez nous contacter à l'adresse : schaarem@gmail.com
